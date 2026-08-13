@@ -36,6 +36,7 @@ pub mod webrtc {
     }
 }
 
+pub use livekit_api::ParticipantToken;
 pub use room::*;
 
 /// `use livekit::prelude::*;` to import livekit types

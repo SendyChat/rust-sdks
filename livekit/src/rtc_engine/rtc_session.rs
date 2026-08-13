@@ -25,7 +25,10 @@ use std::{
 
 use bytes::Bytes;
 use libwebrtc::{prelude::*, stats::RtcStats};
-use livekit_api::signal_client::{SignalClient, SignalEvent, SignalEvents};
+use livekit_api::{
+    signal_client::{SignalClient, SignalEvent, SignalEvents},
+    ParticipantToken,
+};
 use livekit_datatrack::backend as dt;
 use livekit_protocol::{self as proto};
 use livekit_runtime::{sleep, JoinHandle};
@@ -209,7 +212,7 @@ pub enum SessionEvent {
     },
     RefreshToken {
         url: String,
-        token: String,
+        token: ParticipantToken,
     },
     TrackMuted {
         sid: String,
@@ -1060,6 +1063,10 @@ impl SessionInner {
 
                             task.await;
                         }
+                        SignalEvent::TokenRefreshed(token) => {
+                            let url = self.signal_client.url();
+                            let _ = self.emitter.send(SessionEvent::RefreshToken { url, token });
+                        }
                         SignalEvent::Close(reason) => {
                             if !self.closed.load(Ordering::Acquire) {
                                 // SignalClient has been closed unexpectedly
@@ -1431,9 +1438,12 @@ impl SessionInner {
                 let event: dt::remote::SfuSubscriberHandles = subscriber_handles.try_into()?;
                 _ = self.emitter.send(SessionEvent::RemoteDataTrackInput(event.into()));
             }
-            proto::signal_response::Message::RefreshToken(ref token) => {
+            proto::signal_response::Message::RefreshToken(token) => {
                 let url = self.signal_client.url();
-                let _ = self.emitter.send(SessionEvent::RefreshToken { url, token: token.clone() });
+                let _ = self.emitter.send(SessionEvent::RefreshToken {
+                    url,
+                    token: ParticipantToken::from_owned(token),
+                });
             }
             proto::signal_response::Message::Mute(req) => {
                 let _ =

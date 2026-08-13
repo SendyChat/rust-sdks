@@ -1576,8 +1576,10 @@ async fn forward_event(
                 .into(),
             );
         }
-        RoomEvent::TokenRefreshed { token } => {
-            let _ = send_event(proto::TokenRefreshed { token: token.into() }.into());
+        RoomEvent::TokenRefreshed => {
+            // The hardened Rust API intentionally exposes only a notification marker. Plaintext
+            // participant tokens do not cross the observer/FFI queue boundary, so the legacy FFI
+            // payload is deliberately not emitted.
         }
         RoomEvent::DataTrackPublished(track) => {
             let track = FfiRemoteDataTrack::from_track(server, track);

@@ -14,6 +14,16 @@
 
 #![doc = include_str!("../README.md")]
 
+mod participant_token;
+pub use participant_token::ParticipantToken;
+
+#[cfg(any(
+    feature = "signal-client-tokio",
+    feature = "signal-client-async",
+    feature = "signal-client-dispatcher"
+))]
+mod sensitive_header;
+
 #[cfg(feature = "access-token")]
 pub mod access_token;
 

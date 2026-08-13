@@ -12,12 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(any(feature = "signal-client-tokio", feature = "__signal-client-async-compatible"))]
+pub(crate) enum GetWithTokenError {
+    InvalidToken,
+    Transport,
+}
+
 #[cfg(any(feature = "services-tokio", feature = "signal-client-tokio"))]
 mod tokio {
     // The server-API (services) and signal-client backends share reqwest's
     // `Client`; the signal client's region provider needs it too.
     #[cfg(any(feature = "services-tokio", feature = "signal-client-tokio"))]
     pub use reqwest::Client;
+
+    #[cfg(feature = "signal-client-tokio")]
+    pub fn signal_client() -> Client {
+        Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest signal client configuration is valid")
+    }
 
     /// GET with an `Authorization: Bearer <token>` header attached.
     ///
@@ -26,8 +40,18 @@ mod tokio {
     /// the sole caller — uses this helper: the access token must reach the
     /// server or the server returns 401 regardless of the underlying error.
     #[cfg(feature = "signal-client-tokio")]
-    pub async fn get_with_token(url: &str, token: &str) -> reqwest::Result<reqwest::Response> {
-        reqwest::Client::new().get(url).bearer_auth(token).send().await
+    pub async fn get_with_token(
+        url: &str,
+        token: &str,
+    ) -> Result<reqwest::Response, super::GetWithTokenError> {
+        let header = crate::sensitive_header::bearer(token)
+            .map_err(|_| super::GetWithTokenError::InvalidToken)?;
+        signal_client()
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, header)
+            .send()
+            .await
+            .map_err(|_| super::GetWithTokenError::Transport)
     }
 }
 
@@ -102,12 +126,18 @@ mod async_std {
     /// token must reach the server or the server returns 401 regardless of the
     /// underlying error. Mirrors the tokio variant.
     #[cfg(feature = "__signal-client-async-compatible")]
-    pub async fn get_with_token(url: &str, token: &str) -> io::Result<Response> {
+    pub async fn get_with_token(
+        url: &str,
+        token: &str,
+    ) -> Result<Response, super::GetWithTokenError> {
+        let header = crate::sensitive_header::bearer(token)
+            .map_err(|_| super::GetWithTokenError::InvalidToken)?;
         let request = isahc::Request::get(url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", header.as_bytes())
             .body(())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let response = isahc::send_async(request).await?;
+            .map_err(|_| super::GetWithTokenError::Transport)?;
+        let response =
+            isahc::send_async(request).await.map_err(|_| super::GetWithTokenError::Transport)?;
         Ok(Response(response))
     }
 
@@ -142,6 +172,11 @@ mod async_std {
         }
     }
 
+    #[cfg(feature = "__signal-client-async-compatible")]
+    pub fn signal_client() -> Client {
+        Client::new()
+    }
+
     pub struct RequestBuilder {
         builder: isahc::http::request::Builder,
         body: Vec<u8>,
@@ -166,8 +201,10 @@ mod async_std {
                     }
                     None => last_name.clone().expect("HeaderMap yielded a value before any key"),
                 };
-                let value = isahc::http::HeaderValue::from_bytes(value.as_bytes())
+                let sensitive = value.is_sensitive();
+                let mut value = isahc::http::HeaderValue::from_bytes(value.as_bytes())
                     .expect("valid header value");
+                value.set_sensitive(sensitive);
                 dst.append(name, value);
             }
             self

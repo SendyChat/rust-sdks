@@ -39,7 +39,11 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 #[cfg(feature = "__signal-client-async-compatible")]
 use async_tungstenite::tungstenite::Error as WsError;
 
-use crate::{http_client, signal_client::signal_stream::SignalStream};
+use crate::{
+    http_client,
+    signal_client::signal_stream::{DecodedSignal, SignalStream},
+    ParticipantToken,
+};
 
 mod region_url_provider;
 mod signal_stream;
@@ -66,7 +70,7 @@ pub use livekit_common::{CLIENT_PROTOCOL_DATA_STREAM_RPC, CLIENT_PROTOCOL_DEFAUL
 /// clients should assume this client supports.
 const CLIENT_PROTOCOL_VERSION: i32 = CLIENT_PROTOCOL_DATA_STREAM_RPC;
 
-#[derive(Error, Debug)]
+#[derive(Error)]
 pub enum SignalError {
     #[error("ws failure: {0}")]
     WsError(#[from] WsError),
@@ -74,9 +78,9 @@ pub enum SignalError {
     UrlParse(String),
     #[error("access token has invalid characters")]
     TokenFormat,
-    #[error("client error: {0} - {1}")]
+    #[error("client error: {0}")]
     Client(StatusCode, String),
-    #[error("server error: {0} - {1}")]
+    #[error("server error: {0}")]
     Server(StatusCode, String),
     #[error("failed to decode messages from server: {0}")]
     ProtoParse(#[from] prost::DecodeError),
@@ -111,6 +115,15 @@ pub enum SignalError {
     RegionError(String),
     #[error("server sent leave during reconnect: reason={reason:?}, action={action:?}")]
     LeaveRequest { reason: proto::DisconnectReason, action: proto::leave_request::Action },
+}
+
+// `WsError::Http` owns response headers and a body. Its derived Debug includes both, so a
+// hostile or misconfigured endpoint could reflect credentials into diagnostics. Display reports
+// only the status for that variant and is the safe representation for every SignalError.
+impl Debug for SignalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -154,13 +167,16 @@ pub enum SignalEvent {
     /// Received a message from the server
     Message(Box<proto::signal_response::Message>),
 
+    /// A refreshed participant token moved out of the protobuf buffer into zeroizing custody.
+    TokenRefreshed(ParticipantToken),
+
     /// Signal connection closed, SignalClient::restart() can be called to reconnect
     Close(Cow<'static, str>),
 }
 
 struct SignalInner {
     stream: AsyncRwLock<Option<SignalStream>>,
-    token: Mutex<String>, // Token can be refreshed
+    token: Mutex<ParticipantToken>, // Token can be refreshed
     reconnecting: AtomicBool,
     queue: AsyncMutex<Vec<proto::signal_request::Message>>,
     url: String,
@@ -209,7 +225,7 @@ impl SignalClient {
             Err(err) => {
                 // fallback to region urls
                 if matches!(&err, SignalError::WsError(WsError::Http(e)) if e.status() != 403) {
-                    log::error!("unexpected signal error: {}", err.to_string());
+                    log::error!("unexpected signal error: {err}");
                 }
 
                 // Fetching region URLs is best-effort. `fetch_region_urls`
@@ -235,7 +251,7 @@ impl SignalClient {
                 // connection failed.
                 let mut last_err = err;
                 for region_url in urls.iter() {
-                    log::info!("fallback connection to: {}", region_url);
+                    log::info!("fallback connection to: {region_url}");
                     match SignalInner::connect(
                         region_url,
                         token,
@@ -325,13 +341,13 @@ impl SignalClient {
     }
 
     /// Returns the last refreshed token (Or initial token if not refreshed yet)
-    pub fn token(&self) -> String {
+    pub fn token(&self) -> ParticipantToken {
         self.inner.token.lock().clone()
     }
 
     /// Increment request_id for user-initiated requests and [`RequestResponse`][`proto::RequestResponse`]s
     pub fn next_request_id(&self) -> u32 {
-        self.inner.next_request_id().clone()
+        self.inner.next_request_id()
     }
 
     /// Returns whether single peer connection mode is active.
@@ -359,11 +375,8 @@ impl SignalInner {
         token: &str,
         options: SignalOptions,
         publisher_offer: Option<proto::SessionDescription>,
-    ) -> SignalResult<(
-        Arc<Self>,
-        proto::JoinResponse,
-        mpsc::UnboundedReceiver<Box<proto::signal_response::Message>>,
-    )> {
+    ) -> SignalResult<(Arc<Self>, proto::JoinResponse, mpsc::UnboundedReceiver<DecodedSignal>)>
+    {
         // Try v1 path first if single_peer_connection is enabled
         let use_v1_path = options.single_peer_connection;
         // For initial connection: reconnect=false, reconnect_reason=None, participant_sid=""
@@ -382,7 +395,7 @@ impl SignalInner {
                 }
                 Err(err) => {
                     log::warn!(
-                        "signal connection failed on {} path: {:?}",
+                        "signal connection failed on {} path: {}",
                         if use_v1_path { "v1" } else { "v0" },
                         err
                     );
@@ -410,7 +423,7 @@ impl SignalInner {
                         {
                             Ok((new_stream, stream_events)) => (new_stream, stream_events, false),
                             Err(err) => {
-                                log::error!("v0 fallback also failed: {:?}", err);
+                                log::error!("v0 fallback also failed: {err}");
                                 if let SignalError::TokenFormat = err {
                                     return Err(err);
                                 }
@@ -431,7 +444,7 @@ impl SignalInner {
         // Successfully connected to the SignalClient
         let inner = Arc::new(SignalInner {
             stream: AsyncRwLock::new(Some(stream)),
-            token: Mutex::new(token.to_owned()),
+            token: Mutex::new(ParticipantToken::copy_from(token)),
             reconnecting: AtomicBool::new(false),
             queue: Default::default(),
             options,
@@ -458,15 +471,21 @@ impl SignalInner {
         let validate_url = get_validate_url(ws_url);
 
         let validate_fut = async {
-            if let Ok(res) = http_client::get_with_token(validate_url.as_str(), token).await {
-                let status = res.status();
-                let body = res.text().await.ok().unwrap_or_default();
-
-                if status.is_client_error() {
-                    return Err(SignalError::Client(status, body));
-                } else if status.is_server_error() {
-                    return Err(SignalError::Server(status, body));
+            let res = match http_client::get_with_token(validate_url.as_str(), token).await {
+                Ok(res) => res,
+                Err(http_client::GetWithTokenError::InvalidToken) => {
+                    return Err(SignalError::TokenFormat)
                 }
+                // Validation is diagnostic and best-effort. Preserve the original WebSocket
+                // error when the auxiliary HTTP transport itself is unavailable.
+                Err(http_client::GetWithTokenError::Transport) => return Ok(()),
+            };
+            let status = res.status();
+
+            if status.is_client_error() {
+                return Err(SignalError::Client(status, "request rejected".to_owned()));
+            } else if status.is_server_error() {
+                return Err(SignalError::Server(status, "request failed".to_owned()));
             }
 
             Ok(())
@@ -492,10 +511,7 @@ impl SignalInner {
     /// stream is in place.
     pub async fn restart(
         self: &Arc<Self>,
-    ) -> SignalResult<(
-        proto::ReconnectResponse,
-        mpsc::UnboundedReceiver<Box<proto::signal_response::Message>>,
-    )> {
+    ) -> SignalResult<(proto::ReconnectResponse, mpsc::UnboundedReceiver<DecodedSignal>)> {
         // Set reconnecting BEFORE we touch the stream, so concurrent `send` calls
         // see the right state and route queueable messages to the queue (rather
         // than racing on a brief stream=None / reconnecting=false window).
@@ -521,8 +537,8 @@ impl SignalInner {
 
         let result = async {
             let (new_stream, mut events) =
-                SignalStream::connect(lk_url, &token, self.options.connect_timeout).await?;
-            let reconnect_response = get_reconnect_response(&mut events).await?;
+                SignalStream::connect(lk_url, token.as_str(), self.options.connect_timeout).await?;
+            let reconnect_response = get_reconnect_response(&mut events, self).await?;
             SignalResult::Ok((new_stream, reconnect_response, events))
         }
         .await;
@@ -616,7 +632,7 @@ impl SignalInner {
                 // log::warn!("sending queued signal: {:?}", signal);
 
                 if let Err(err) = stream.send(signal).await {
-                    log::error!("failed to send queued signal: {}", err); // Lost message
+                    log::error!("failed to send queued signal: {err}"); // Lost message
                 }
             }
         }
@@ -632,7 +648,7 @@ impl SignalInner {
 async fn signal_task(
     inner: Arc<SignalInner>,
     emitter: SignalEmitter, // Public emitter
-    mut internal_events: mpsc::UnboundedReceiver<Box<proto::signal_response::Message>>,
+    mut internal_events: mpsc::UnboundedReceiver<DecodedSignal>,
 ) {
     let mut ping_interval = interval(Duration::from_secs(inner.join_response.ping_interval as u64));
     let timeout_duration = Duration::from_secs(inner.join_response.ping_timeout as u64);
@@ -646,26 +662,38 @@ async fn signal_task(
             signal = internal_events.recv() => {
                 if let Some(signal) = signal {
                     // Received a message from the server
-                    match signal.as_ref() {
-                        proto::signal_response::Message::RefreshToken(ref token) => {
-                            // Refresh the token so the client can still reconnect if the initial join token expired
-                            *inner.token.lock() = token.clone();
-                        }
-                        proto::signal_response::Message::PongResp(ref pong) => {
-                            // Reset the ping_timeout if we received a pong
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64;
-
-                            rtt = now - pong.last_ping_timestamp;
-                        }
-                        _ => {}
-                    }
-
                     ping_timeout.as_mut().reset(Instant::now() + timeout_duration);
 
-                    let _ = emitter.send(SignalEvent::Message(signal));
+                    match signal {
+                        DecodedSignal::TokenRefreshed(token) => {
+                            // Replacing the stored token erases the previous allocation on drop.
+                            *inner.token.lock() = token.clone();
+                            let _ = emitter.send(SignalEvent::TokenRefreshed(token));
+                            continue;
+                        }
+                        DecodedSignal::RoomMoved { moved, token } => {
+                            *inner.token.lock() = token.clone();
+                            let _ = emitter.send(SignalEvent::TokenRefreshed(token));
+                            let _ = emitter.send(SignalEvent::Message(Box::new(
+                                proto::signal_response::Message::RoomMoved(*moved),
+                            )));
+                        }
+                        DecodedSignal::Message(signal) => {
+                            if let proto::signal_response::Message::PongResp(ref pong) =
+                                signal.as_ref()
+                            {
+                                // Reset the ping_timeout if we received a pong
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as i64;
+
+                                rtt = now - pong.last_ping_timestamp;
+                            }
+
+                            let _ = emitter.send(SignalEvent::Message(signal));
+                        }
+                    }
                 } else {
                     let _ = emitter.send(SignalEvent::Close("stream closed".into()));
                     break; // Stream closed
@@ -731,7 +759,7 @@ fn client_info_sdk_for_name(sdk: &str) -> proto::client_info::Sdk {
         "node" => proto::client_info::Sdk::Node,
         "esp32" => proto::client_info::Sdk::Esp32,
         _ => {
-            log::warn!("unknown SDK name in signal options: {}", sdk);
+            log::warn!("unknown SDK name in signal options: {sdk}");
             proto::client_info::Sdk::Unknown
         }
     }
@@ -743,14 +771,18 @@ fn client_info_sdk_for_name(sdk: &str) -> proto::client_info::Sdk {
 /// - options: SignalOptions containing auto_subscribe, adaptive_stream, etc.
 /// - reconnect: true if this is a reconnection attempt
 /// - participant_sid: the participant SID (only used during reconnection)
+struct JoinClientInfo {
+    os: String,
+    os_version: String,
+    device_model: String,
+}
+
 fn create_join_request_param(
     options: &SignalOptions,
     reconnect: bool,
     reconnect_reason: Option<i32>,
     participant_sid: &str,
-    os: String,
-    os_version: String,
-    device_model: String,
+    client: JoinClientInfo,
     publisher_offer: Option<&proto::SessionDescription>,
 ) -> String {
     let connection_settings = proto::ConnectionSettings {
@@ -763,9 +795,9 @@ fn create_join_request_param(
         sdk: client_info_sdk_for_name(&options.sdk_options.sdk) as i32,
         version: options.sdk_options.sdk_version.clone().unwrap_or_default(),
         protocol: PROTOCOL_VERSION as i32,
-        os,
-        os_version,
-        device_model,
+        os: client.os,
+        os_version: client.os_version,
+        device_model: client.device_model,
         capabilities: CLIENT_CAPABILITIES.iter().map(|c| *c as i32).collect(),
         client_protocol: CLIENT_PROTOCOL_VERSION,
         ..Default::default()
@@ -871,9 +903,11 @@ fn get_livekit_url(
             reconnect,
             reconnect_reason,
             participant_sid,
-            os_info.os_type().to_string(),
-            os_info.version().to_string(),
-            device_model.to_string(),
+            JoinClientInfo {
+                os: os_info.os_type().to_string(),
+                os_version: os_info.version().to_string(),
+                device_model: device_model.to_string(),
+            },
             publisher_offer,
         );
         lk_url.query_pairs_mut().append_pair("join_request", &join_request_param);
@@ -894,12 +928,10 @@ fn get_livekit_url(
             lk_url.query_pairs_mut().append_pair("version", sdk_version.as_str());
         }
 
-        // parse client capabilities
-        if !CLIENT_CAPABILITIES.is_empty() {
-            let caps =
-                CLIENT_CAPABILITIES.iter().map(|c| c.as_str_name()).collect::<Vec<_>>().join(",");
-            lk_url.query_pairs_mut().append_pair("capabilities", &caps);
-        }
+        // `CLIENT_CAPABILITIES` is a non-empty compile-time protocol contract.
+        let caps =
+            CLIENT_CAPABILITIES.iter().map(|c| c.as_str_name()).collect::<Vec<_>>().join(",");
+        lk_url.query_pairs_mut().append_pair("capabilities", &caps);
 
         // For reconnects in v0 path, add reconnect and sid as separate query parameters
         if reconnect {
@@ -925,13 +957,13 @@ fn get_validate_url(mut ws_url: url::Url) -> url::Url {
 
 macro_rules! get_async_message {
     ($fnc:ident, $pattern:pat => $result:expr, $ty:ty) => {
-        async fn $fnc(
-            receiver: &mut mpsc::UnboundedReceiver<Box<proto::signal_response::Message>>,
-        ) -> SignalResult<$ty> {
+        async fn $fnc(receiver: &mut mpsc::UnboundedReceiver<DecodedSignal>) -> SignalResult<$ty> {
             let join = async {
                 while let Some(event) = receiver.recv().await {
-                    if let $pattern = *event {
-                        return Ok($result);
+                    if let DecodedSignal::Message(event) = event {
+                        if let $pattern = *event {
+                            return Ok($result);
+                        }
                     }
                 }
 
@@ -952,19 +984,25 @@ get_async_message!(
 );
 
 async fn get_reconnect_response(
-    receiver: &mut mpsc::UnboundedReceiver<Box<proto::signal_response::Message>>,
+    receiver: &mut mpsc::UnboundedReceiver<DecodedSignal>,
+    inner: &SignalInner,
 ) -> SignalResult<proto::ReconnectResponse> {
     let join = async {
         while let Some(event) = receiver.recv().await {
-            match *event {
-                proto::signal_response::Message::Reconnect(msg) => return Ok(msg),
-                proto::signal_response::Message::Leave(leave) => {
-                    return Err(SignalError::LeaveRequest {
-                        reason: leave.reason(),
-                        action: leave.action(),
-                    });
+            match event {
+                DecodedSignal::Message(event) => match *event {
+                    proto::signal_response::Message::Reconnect(msg) => return Ok(msg),
+                    proto::signal_response::Message::Leave(leave) => {
+                        return Err(SignalError::LeaveRequest {
+                            reason: leave.reason(),
+                            action: leave.action(),
+                        });
+                    }
+                    _ => {}
+                },
+                DecodedSignal::TokenRefreshed(token) | DecodedSignal::RoomMoved { token, .. } => {
+                    *inner.token.lock() = token;
                 }
-                _ => {}
             }
         }
 
@@ -1016,15 +1054,189 @@ mod tests {
     fn make_stub_inner() -> Arc<SignalInner> {
         Arc::new(SignalInner {
             stream: AsyncRwLock::new(None),
-            token: Mutex::new(String::new()),
+            token: Mutex::new(ParticipantToken::from_owned(String::new())),
             reconnecting: AtomicBool::new(false),
             queue: Default::default(),
             url: "wss://localhost:7880".to_string(),
             options: SignalOptions::default(),
-            join_response: proto::JoinResponse::default(),
+            join_response: proto::JoinResponse {
+                participant: Some(proto::ParticipantInfo {
+                    sid: "test-participant".to_owned(),
+                    ..Default::default()
+                }),
+                ping_interval: 60,
+                ping_timeout: 60,
+                ..Default::default()
+            },
             request_id: AtomicU32::new(1),
             single_pc_mode_active: false,
         })
+    }
+
+    #[test]
+    fn stored_and_reconnect_token_copies_are_redacted_zeroizing_owners() {
+        const SENTINEL: &str = "sendy-signal-inner-token-sentinel";
+        let inner = make_stub_inner();
+        *inner.token.lock() = ParticipantToken::from_owned(SENTINEL.to_owned());
+
+        let client =
+            SignalClient { inner, emitter: mpsc::unbounded_channel().0, handle: Mutex::new(None) };
+        let mut reconnect_copy = client.token();
+
+        assert_eq!(reconnect_copy.as_str(), SENTINEL);
+        assert!(!format!("{reconnect_copy:?}").contains(SENTINEL));
+        zeroize::Zeroize::zeroize(&mut reconnect_copy);
+        assert!(reconnect_copy.as_str().is_empty());
+    }
+
+    #[test]
+    fn refresh_replacement_and_teardown_run_zeroizing_drop_paths() {
+        use crate::participant_token::observed_zeroizing_drops;
+
+        let inner = make_stub_inner();
+        *inner.token.lock() = ParticipantToken::from_owned("sendy-initial-token".to_owned());
+        let before_replacement = observed_zeroizing_drops();
+
+        *inner.token.lock() = ParticipantToken::from_owned("sendy-refreshed-token".to_owned());
+        assert!(observed_zeroizing_drops() > before_replacement);
+
+        let before_teardown = observed_zeroizing_drops();
+        drop(inner);
+        assert!(observed_zeroizing_drops() > before_teardown);
+    }
+
+    #[cfg(feature = "signal-client-tokio")]
+    #[tokio::test]
+    async fn refresh_and_room_moved_replace_storage_before_token_free_public_messages() {
+        const FIRST: &str = "sendy-refresh-token-sentinel";
+        const SECOND: &str = "sendy-room-moved-token-sentinel";
+        let inner = make_stub_inner();
+        let (internal_tx, internal_rx) = mpsc::unbounded_channel();
+        let (emitter, mut events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(signal_task(inner.clone(), emitter, internal_rx));
+
+        internal_tx
+            .send(DecodedSignal::TokenRefreshed(ParticipantToken::from_owned(FIRST.to_owned())))
+            .unwrap();
+        let SignalEvent::TokenRefreshed(first) = events.recv().await.unwrap() else {
+            panic!("refresh must use the protected event variant")
+        };
+        assert_eq!(first.as_str(), FIRST);
+        assert_eq!(inner.token.lock().as_str(), FIRST);
+        drop(first);
+
+        internal_tx
+            .send(DecodedSignal::RoomMoved {
+                moved: Box::new(proto::RoomMovedResponse::default()),
+                token: ParticipantToken::from_owned(SECOND.to_owned()),
+            })
+            .unwrap();
+        let SignalEvent::TokenRefreshed(second) = events.recv().await.unwrap() else {
+            panic!("room move must refresh protected token custody first")
+        };
+        assert_eq!(second.as_str(), SECOND);
+        assert_eq!(inner.token.lock().as_str(), SECOND);
+        drop(second);
+
+        let SignalEvent::Message(message) = events.recv().await.unwrap() else {
+            panic!("room move must preserve its sanitized provider message")
+        };
+        let proto::signal_response::Message::RoomMoved(moved) = *message else {
+            panic!("expected sanitized room move")
+        };
+        assert!(moved.token.is_empty());
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[cfg(feature = "signal-client-tokio")]
+    #[tokio::test]
+    async fn failed_and_timed_out_restart_drop_each_reconnect_copy() {
+        use crate::participant_token::observed_zeroizing_drops;
+
+        let invalid = make_stub_inner();
+        *invalid.token.lock() = ParticipantToken::from_owned("sendy-invalid-token\n".to_owned());
+        let before_invalid = observed_zeroizing_drops();
+        assert!(invalid.restart().await.is_err());
+        assert!(observed_zeroizing_drops() > before_invalid);
+        assert_eq!(invalid.token.lock().as_str(), "sendy-invalid-token\n");
+
+        let options = SignalOptions { connect_timeout: Duration::ZERO, ..Default::default() };
+        let timed_out =
+            Arc::new(SignalInner { options, ..Arc::try_unwrap(make_stub_inner()).ok().unwrap() });
+        *timed_out.token.lock() = ParticipantToken::from_owned("sendy-timeout-token".to_owned());
+        let before_timeout = observed_zeroizing_drops();
+        assert!(timed_out.restart().await.is_err());
+        assert!(observed_zeroizing_drops() > before_timeout);
+        assert_eq!(timed_out.token.lock().as_str(), "sendy-timeout-token");
+    }
+
+    #[cfg(feature = "signal-client-tokio")]
+    #[tokio::test]
+    async fn cancelled_restart_drops_its_reconnect_copy() {
+        use crate::participant_token::observed_zeroizing_drops;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let accept_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _socket = socket;
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        let options =
+            SignalOptions { connect_timeout: Duration::from_secs(60), ..Default::default() };
+        let reconnecting = Arc::new(SignalInner {
+            options,
+            url: format!("ws://127.0.0.1:{}", addr.port()),
+            ..Arc::try_unwrap(make_stub_inner()).ok().unwrap()
+        });
+        *reconnecting.token.lock() =
+            ParticipantToken::from_owned("sendy-cancelled-token".to_owned());
+
+        let before_cancel = observed_zeroizing_drops();
+        let restart_inner = reconnecting.clone();
+        let restart_task = tokio::spawn(async move { restart_inner.restart().await });
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("restart did not reach the stalled handshake")
+            .expect("stalled handshake task ended before accepting");
+
+        restart_task.abort();
+        let _ = restart_task.await;
+        accept_task.abort();
+        let _ = accept_task.await;
+
+        assert!(observed_zeroizing_drops() > before_cancel);
+        assert_eq!(reconnecting.token.lock().as_str(), "sendy-cancelled-token");
+    }
+
+    #[cfg(feature = "signal-client-tokio")]
+    #[test]
+    fn signal_errors_never_format_http_response_or_server_body() {
+        const SENTINEL: &str = "sendy-reflected-token-sentinel";
+        let response = http::Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Some(SENTINEL.as_bytes().to_vec()))
+            .unwrap();
+        let websocket = SignalError::WsError(WsError::Http(Box::new(response)));
+        let client = SignalError::Client(StatusCode::UNAUTHORIZED, SENTINEL.to_owned());
+        let server = SignalError::Server(StatusCode::INTERNAL_SERVER_ERROR, SENTINEL.to_owned());
+
+        for formatted in [
+            format!("{websocket:?}"),
+            websocket.to_string(),
+            format!("{client:?}"),
+            client.to_string(),
+            format!("{server:?}"),
+            server.to_string(),
+        ] {
+            assert!(!formatted.contains(SENTINEL));
+        }
     }
 
     #[cfg(feature = "signal-client-tokio")]
@@ -1236,7 +1448,7 @@ mod tests {
 
         let ws_url = url::Url::parse(&format!("ws://127.0.0.1:{}/rtc", addr.port())).unwrap();
         let result = SignalInner::validate(ws_url, "test-bearer-token").await;
-        assert!(result.is_ok(), "expected Ok from validate, got: {:?}", result);
+        assert!(result.is_ok(), "expected Ok from validate, got: {result:?}");
 
         let request = rx.await.expect("server task never received a request");
         let request = String::from_utf8_lossy(&request);
@@ -1245,8 +1457,7 @@ mod tests {
         // canonical `Authorization` but we normalise both for robustness.
         assert!(
             request.to_lowercase().contains("authorization: bearer test-bearer-token"),
-            "validate() must attach the access token as a Bearer header; request was:\n{}",
-            request
+            "validate() must attach the access token as a Bearer header; request was:\n{request}"
         );
     }
 
@@ -1275,7 +1486,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, SignalError::Timeout(_)), "expected Timeout error, got: {:?}", err);
+        assert!(matches!(err, SignalError::Timeout(_)), "expected Timeout error, got: {err:?}");
     }
 
     #[cfg(feature = "signal-client-tokio")]
@@ -1344,8 +1555,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(err, SignalError::RegionError(ref msg) if msg.contains("timed out")),
-            "expected RegionError with 'timed out', got: {:?}",
-            err
+            "expected RegionError with 'timed out', got: {err:?}"
         );
     }
 
@@ -1364,7 +1574,7 @@ mod tests {
 
         // The error should be a RegionError
         let SignalError::RegionError(msg) = err else {
-            panic!("expected RegionError, got: {:?}", err);
+            panic!("expected RegionError, got: {err:?}");
         };
 
         // The error message should contain information about the connection failure.
@@ -1372,19 +1582,14 @@ mod tests {
         // "error sending request" - it should include the underlying cause.
         assert!(
             msg.contains("error sending request") || msg.contains("connection"),
-            "Error should mention the request failure, got: {}",
-            msg
+            "Error should mention the request failure, got: {msg}"
         );
 
         // Most importantly, verify the error contains a colon, indicating the chain
         // was preserved (format is "outer: middle: inner")
         // Note: On some platforms the error might be simple, so we just verify
         // we got a descriptive error message
-        assert!(
-            msg.len() > 20,
-            "Error message should be descriptive with chain info, got: {}",
-            msg
-        );
+        assert!(msg.len() > 20, "Error message should be descriptive with chain info, got: {msg}");
     }
 
     /// Test that JSON parsing errors include the full error chain.
@@ -1421,14 +1626,13 @@ mod tests {
         let err = result.unwrap_err();
 
         let SignalError::RegionError(msg) = err else {
-            panic!("expected RegionError, got: {:?}", err);
+            panic!("expected RegionError, got: {err:?}");
         };
 
         // The error should mention JSON parsing failure
         assert!(
             msg.contains("missing field") || msg.contains("error decoding") || msg.contains("JSON"),
-            "Error should mention JSON parsing failure, got: {}",
-            msg
+            "Error should mention JSON parsing failure, got: {msg}"
         );
     }
 }

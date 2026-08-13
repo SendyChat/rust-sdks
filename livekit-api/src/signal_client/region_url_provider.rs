@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-use http::header::{HeaderMap, HeaderValue, AUTHORIZATION, CACHE_CONTROL};
+use http::header::{HeaderMap, AUTHORIZATION, CACHE_CONTROL};
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -170,9 +170,13 @@ pub(crate) async fn fetch_from_endpoint(
     token: &str,
 ) -> SignalResult<(Vec<String>, Option<Duration>)> {
     let fetch_fut = async {
-        let client = http_client::Client::new();
+        // A fresh client bounds authenticated header ownership to this request/response and the
+        // surrounding timeout. The tokio backend also disables redirects for this client.
+        let client = http_client::signal_client();
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", token)).unwrap());
+        let auth_header =
+            crate::sensitive_header::bearer(token).map_err(|_| SignalError::TokenFormat)?;
+        headers.insert(AUTHORIZATION, auth_header);
         let res = client
             .get(endpoint_url)
             .headers(headers)
@@ -181,7 +185,7 @@ pub(crate) async fn fetch_from_endpoint(
             .map_err(|e| SignalError::RegionError(error_with_chain(&e)))?;
 
         if !res.status().is_success() {
-            return Err(SignalError::Client(res.status(), res.text().await.unwrap_or_default()));
+            return Err(SignalError::Client(res.status(), "region request rejected".to_owned()));
         }
 
         // Read the cache lifetime before `json()` consumes the response.
@@ -331,18 +335,15 @@ mod tests {
         // Verify the full chain is in the error message
         assert!(
             error_string.contains("UnknownIssuer"),
-            "Error should contain root cause 'UnknownIssuer', got: {}",
-            error_string
+            "Error should contain root cause 'UnknownIssuer', got: {error_string}"
         );
         assert!(
             error_string.contains("error trying to connect"),
-            "Error should contain middle error, got: {}",
-            error_string
+            "Error should contain middle error, got: {error_string}"
         );
         assert!(
             error_string.contains("error sending request"),
-            "Error should contain outer error, got: {}",
-            error_string
+            "Error should contain outer error, got: {error_string}"
         );
     }
 
@@ -350,13 +351,12 @@ mod tests {
     fn test_error_with_chain_io_error() {
         // Test with a real std::io::Error chain
         let inner = io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
-        let outer = io::Error::new(io::ErrorKind::Other, inner);
+        let outer = io::Error::other(inner);
 
         let result = error_with_chain(&outer);
         assert!(
             result.contains("connection refused"),
-            "Should contain the inner error message, got: {}",
-            result
+            "Should contain the inner error message, got: {result}"
         );
     }
 

@@ -74,7 +74,10 @@ futures = "0.3"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 lazy_static = "1.4"
-log = "0.4"
+# WebSocket handshakes contain the participant Authorization header in transport-owned
+# buffers. tungstenite 0.29 traces the serialized request verbatim, so trace logging must
+# be compiled out for every consumer of this workspace. Release builds are tighter still.
+log = { version = "0.4", features = ["max_level_debug", "release_max_level_info"] }
 parking_lot = "0.12"
 prost = "0.14"
 prost-build = "0.14"
@@ -86,6 +89,7 @@ thiserror = "2"
 tokio = { version = "1", default-features = false }
 tokio-stream = "0.1"
 uniffi = "0.31"
+zeroize = "=1.9.0"
 
 # For examples
 eframe = { version = "0.35.0", default-features = false }

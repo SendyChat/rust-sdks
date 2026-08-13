@@ -24,9 +24,11 @@ use std::{
 use futures_util::Stream;
 use libloading::{Library, Symbol};
 use libwebrtc::{audio_stream::native::NativeAudioStream, prelude::AudioFrame};
+use livekit_api::ParticipantToken;
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::json;
+use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
@@ -218,15 +220,21 @@ impl AudioFilterPlugin {
         }
     }
 
-    pub fn update_token(&self, url: String, token: String) {
+    pub fn update_token(&self, url: String, token: &ParticipantToken) {
         if self.update_token_fn_ptr.is_null() {
             return;
         }
+        // SAFETY: the loader resolves this pointer from the plugin's
+        // `update_refreshed_token` symbol using the matching ABI.
         let update_token_fn: UpdateRefreshedTokenFn =
             unsafe { std::mem::transmute(self.update_token_fn_ptr) };
         let url = CString::new(url).unwrap();
-        let token = CString::new(token).unwrap();
-        unsafe { update_token_fn(url.as_ptr(), token.as_ptr()) }
+        let mut token_bytes = Zeroizing::new(Vec::with_capacity(token.as_str().len() + 1));
+        token_bytes.extend_from_slice(token.as_str().as_bytes());
+        token_bytes.push(0);
+        // SAFETY: both NUL-terminated buffers remain alive for the duration of the synchronous
+        // callback. The token allocation is erased immediately after the callback returns.
+        unsafe { update_token_fn(url.as_ptr(), token_bytes.as_ptr().cast()) }
     }
 
     pub fn supports_separate_rates(&self) -> bool {

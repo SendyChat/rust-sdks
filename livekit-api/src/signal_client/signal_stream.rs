@@ -25,7 +25,7 @@ use std::{env, io, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "signal-client-tokio")]
-use base64;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 
 #[cfg(feature = "signal-client-tokio")]
 use tokio::{
@@ -38,7 +38,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::client::IntoClientRequest,
     tungstenite::error::ProtocolError,
-    tungstenite::http::{header::AUTHORIZATION, HeaderValue},
+    tungstenite::http::header::AUTHORIZATION,
     tungstenite::{Error as WsError, Message},
     MaybeTlsStream, WebSocketStream,
 };
@@ -49,19 +49,42 @@ use async_tungstenite::{
     async_std::ClientStream as MaybeTlsStream,
     tungstenite::client::IntoClientRequest,
     tungstenite::error::ProtocolError,
-    tungstenite::http::{header::AUTHORIZATION, HeaderValue},
+    tungstenite::http::header::AUTHORIZATION,
     tungstenite::{Error as WsError, Message},
     WebSocketStream,
 };
 
 use super::{SignalError, SignalResult};
+use crate::ParticipantToken;
 
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// A decoded provider message with participant tokens removed from ordinary protobuf storage at
+/// the first post-transport boundary. Queue cancellation/drop therefore always reaches a
+/// zeroizing owner.
+pub(super) enum DecodedSignal {
+    Message(Box<proto::signal_response::Message>),
+    TokenRefreshed(ParticipantToken),
+    RoomMoved { moved: Box<proto::RoomMovedResponse>, token: ParticipantToken },
+}
+
+fn secure_decoded_signal(message: proto::signal_response::Message) -> DecodedSignal {
+    match message {
+        proto::signal_response::Message::RefreshToken(token) => {
+            DecodedSignal::TokenRefreshed(ParticipantToken::from_owned(token))
+        }
+        proto::signal_response::Message::RoomMoved(mut moved) => {
+            let token = ParticipantToken::from_owned(std::mem::take(&mut moved.token));
+            DecodedSignal::RoomMoved { moved: Box::new(moved), token }
+        }
+        message => DecodedSignal::Message(Box::new(message)),
+    }
+}
 
 #[derive(Debug)]
 enum InternalMessage {
     Signal {
-        signal: proto::signal_request::Message,
+        signal: Box<proto::signal_request::Message>,
         response_chn: oneshot::Sender<SignalResult<()>>,
     },
     Pong {
@@ -90,7 +113,7 @@ impl SignalStream {
         url: url::Url,
         token: &str,
         connect_timeout: Duration,
-    ) -> SignalResult<(Self, mpsc::UnboundedReceiver<Box<proto::signal_response::Message>>)> {
+    ) -> SignalResult<(Self, mpsc::UnboundedReceiver<DecodedSignal>)> {
         let connect_fut = Self::connect_inner(url, token);
         livekit_runtime::timeout(connect_timeout, connect_fut)
             .await
@@ -100,11 +123,11 @@ impl SignalStream {
     async fn connect_inner(
         url: url::Url,
         token: &str,
-    ) -> SignalResult<(Self, mpsc::UnboundedReceiver<Box<proto::signal_response::Message>>)> {
-        log::info!("connecting to {}", url);
+    ) -> SignalResult<(Self, mpsc::UnboundedReceiver<DecodedSignal>)> {
+        log::info!("connecting to {url}");
         let mut request = url.clone().into_client_request()?;
-        let auth_header = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| SignalError::TokenFormat)?;
+        let auth_header =
+            crate::sensitive_header::bearer(token).map_err(|_| SignalError::TokenFormat)?;
         request.headers_mut().insert(AUTHORIZATION, auth_header);
 
         #[cfg(feature = "signal-client-tokio")]
@@ -119,11 +142,11 @@ impl SignalStream {
             // Connect directly or through proxy
             let ws_stream = if let Ok(proxy_url) = proxy_env {
                 if !proxy_url.is_empty() {
-                    log::info!("Using proxy: {}", proxy_url);
+                    log::info!("Using proxy: {proxy_url}");
                     let proxy_url = url::Url::parse(&proxy_url).map_err(|e| {
                         WsError::Io(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("Invalid proxy URL: {}", e),
+                            format!("Invalid proxy URL: {e}"),
                         ))
                     })?;
 
@@ -149,26 +172,26 @@ impl SignalStream {
                     })?;
 
                     let proxy_port = proxy_url.port_or_known_default().unwrap_or(80);
-                    let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
+                    let proxy_addr = format!("{proxy_host}:{proxy_port}");
 
                     let mut proxy_stream =
                         TokioTcpStream::connect(proxy_addr).await.map_err(WsError::Io)?;
 
                     let mut proxy_auth_header = None;
                     if let Some(password) = proxy_url.password() {
-                        let auth = format!("{}:{}", proxy_url.username(), password);
-                        let auth = format!("Basic {}", base64::encode(auth));
+                        let auth = format!("{}:{password}", proxy_url.username());
+                        let auth = format!("Basic {}", BASE64_STANDARD.encode(auth));
                         proxy_auth_header = Some(auth);
                     }
 
                     // Send CONNECT request
-                    let target = format!("{}:{}", host, port);
+                    let target = format!("{host}:{port}");
                     let mut connect_req =
-                        format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n", target, target);
+                        format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
 
                     // Add proxy authorization if needed
                     if let Some(auth) = proxy_auth_header {
-                        connect_req.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
+                        connect_req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
                     }
 
                     // Finalize request
@@ -213,12 +236,12 @@ impl SignalStream {
                     if !status_line.contains("200") {
                         return Err(WsError::Io(io::Error::new(
                             io::ErrorKind::ConnectionRefused,
-                            format!("Proxy connection failed: {}", status_line),
+                            format!("Proxy connection failed: {status_line}"),
                         ))
                         .into());
                     }
 
-                    log::debug!("Proxy connection established to {}", target);
+                    log::debug!("Proxy connection established to {target}");
 
                     // Create MaybeTlsStream based on original URL scheme
                     let stream = if url.scheme() == "wss" {
@@ -242,13 +265,10 @@ impl SignalStream {
                                 );
                             }
                             if cert_result.certs.is_empty() {
-                                return Err(WsError::Io(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!(
-                                        "Could not load any native root certificates: {:?}",
-                                        cert_result.errors
-                                    ),
-                                ))
+                                return Err(WsError::Io(io::Error::other(format!(
+                                    "Could not load any native root certificates: {:?}",
+                                    cert_result.errors
+                                )))
                                 .into());
                             }
                             let total = cert_result.certs.len();
@@ -266,7 +286,7 @@ impl SignalStream {
                                 ServerName::try_from(host.to_owned()).map_err(|_| {
                                     WsError::Io(io::Error::new(
                                         io::ErrorKind::InvalidInput,
-                                        format!("Invalid DNS name: {}", host),
+                                        format!("Invalid DNS name: {host}"),
                                     ))
                                 })?;
 
@@ -275,10 +295,9 @@ impl SignalStream {
                                 .connect(server_name, proxy_stream)
                                 .await
                                 .map_err(|e| {
-                                    WsError::Io(io::Error::new(
-                                        io::ErrorKind::Other,
-                                        format!("TLS connection error: {}", e),
-                                    ))
+                                    WsError::Io(io::Error::other(format!(
+                                        "TLS connection error: {e}"
+                                    )))
                                 })?;
 
                             MaybeTlsStream::Rustls(tls_stream)
@@ -343,7 +362,7 @@ impl SignalStream {
     /// It also waits for the message to be sent
     pub async fn send(&self, signal: proto::signal_request::Message) -> SignalResult<()> {
         let (send, recv) = oneshot::channel();
-        let msg = InternalMessage::Signal { signal, response_chn: send };
+        let msg = InternalMessage::Signal { signal: Box::new(signal), response_chn: send };
         let _ = self.internal_tx.send(msg).await;
         recv.await.map_err(|_| SignalError::SendError)?
     }
@@ -357,7 +376,7 @@ impl SignalStream {
         while let Some(msg) = internal_rx.recv().await {
             match msg {
                 InternalMessage::Signal { signal, response_chn } => {
-                    let data = proto::SignalRequest { message: Some(signal) }.encode_to_vec();
+                    let data = proto::SignalRequest { message: Some(*signal) }.encode_to_vec();
 
                     if let Err(err) = ws_writer.send(Message::Binary(data.into())).await {
                         let _ = response_chn.send(Err(err.into()));
@@ -368,7 +387,7 @@ impl SignalStream {
                 }
                 InternalMessage::Pong { ping_data } => {
                     if let Err(err) = ws_writer.send(Message::Pong(ping_data)).await {
-                        log::error!("failed to send pong message: {:?}", err);
+                        log::error!("failed to send pong message: {err:?}");
                     }
                 }
                 InternalMessage::Close => break,
@@ -385,7 +404,7 @@ impl SignalStream {
     async fn read_task(
         internal_tx: mpsc::Sender<InternalMessage>,
         mut ws_reader: SplitStream<WebSocket>,
-        emitter: mpsc::UnboundedSender<Box<proto::signal_response::Message>>,
+        emitter: mpsc::UnboundedSender<DecodedSignal>,
     ) {
         while let Some(msg) = ws_reader.next().await {
             match msg {
@@ -394,7 +413,7 @@ impl SignalStream {
                         .expect("failed to decode SignalResponse");
 
                     if let Some(msg) = res.message {
-                        let _ = emitter.send(Box::new(msg));
+                        let _ = emitter.send(secure_decoded_signal(msg));
                     }
                 }
                 Ok(Message::Ping(data)) => {
@@ -402,7 +421,7 @@ impl SignalStream {
                     continue;
                 }
                 Ok(Message::Close(close)) => {
-                    log::debug!("server closed the connection: {:?}", close);
+                    log::debug!("server closed the connection: {close:?}");
                     break;
                 }
                 Ok(Message::Frame(_)) => {}
@@ -425,12 +444,47 @@ impl SignalStream {
                     break;
                 }
                 _ => {
-                    log::error!("unhandled websocket message {:?}", msg);
+                    log::error!("unhandled websocket message {msg:?}");
                     break;
                 }
             }
         }
 
         let _ = internal_tx.send(InternalMessage::Close).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SENTINEL: &str = "sendy-decoded-signal-token-sentinel";
+
+    #[test]
+    fn refresh_token_enters_zeroizing_redacted_custody_immediately() {
+        let decoded = secure_decoded_signal(proto::signal_response::Message::RefreshToken(
+            SENTINEL.to_owned(),
+        ));
+
+        let DecodedSignal::TokenRefreshed(token) = decoded else {
+            panic!("refresh token must use the sensitive event variant")
+        };
+        assert_eq!(token.as_str(), SENTINEL);
+        assert!(!format!("{token:?}").contains(SENTINEL));
+    }
+
+    #[test]
+    fn room_moved_token_is_removed_before_the_protobuf_event_is_queued() {
+        let decoded = secure_decoded_signal(proto::signal_response::Message::RoomMoved(
+            proto::RoomMovedResponse { token: SENTINEL.to_owned(), ..Default::default() },
+        ));
+
+        let DecodedSignal::RoomMoved { moved, token } = decoded else {
+            panic!("room moved must use the sensitive event variant")
+        };
+        assert!(moved.token.is_empty());
+        assert_eq!(token.as_str(), SENTINEL);
+        assert!(!format!("{moved:?}").contains(SENTINEL));
+        assert!(!format!("{token:?}").contains(SENTINEL));
     }
 }

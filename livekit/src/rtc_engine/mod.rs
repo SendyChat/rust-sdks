@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use libwebrtc::prelude::*;
-use livekit_api::signal_client::{SignalError, SignalOptions};
+use livekit_api::{
+    signal_client::{SignalError, SignalOptions},
+    ParticipantToken,
+};
 use livekit_datatrack::backend as dt;
 use livekit_protocol as proto;
 use livekit_runtime::JoinHandle;
@@ -210,7 +213,7 @@ pub enum EngineEvent {
     },
     RefreshToken {
         url: String,
-        token: String,
+        token: ParticipantToken,
     },
     TrackMuted {
         sid: String,
@@ -930,7 +933,7 @@ impl EngineInner {
                 match self
                     .try_restart_connection(
                         &url,
-                        &token,
+                        token.as_str(),
                         self.options.clone(),
                         e2ee_manager.clone(),
                     )

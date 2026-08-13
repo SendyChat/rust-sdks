@@ -28,6 +28,7 @@ use livekit_api::signal_client::{
     SignalOptions, SignalSdkOptions, CLIENT_PROTOCOL_DATA_STREAM_RPC, CLIENT_PROTOCOL_DEFAULT,
     SIGNAL_CONNECT_TIMEOUT,
 };
+use livekit_api::ParticipantToken;
 use livekit_datatrack::{
     api::{DataTrackSid, RemoteDataTrack},
     backend as dt,
@@ -269,9 +270,9 @@ pub enum RoomEvent {
     ParticipantsUpdated {
         participants: Vec<Participant>,
     },
-    TokenRefreshed {
-        token: String,
-    },
+    /// The provider accepted a refreshed token. The plaintext remains in internal zeroizing
+    /// custody and is never copied into public observer queues.
+    TokenRefreshed,
     /// A remote participant published a data track.
     DataTrackPublished(RemoteDataTrack),
     /// A remote participant has unpublished a data track.
@@ -1529,7 +1530,6 @@ impl RoomSession {
     }
 
     fn handle_room_moved(self: &Arc<Self>, moved: proto::RoomMovedResponse) {
-        self.handle_refresh_token(self.rtc_engine.session().signal_client().url(), moved.token);
         if let Some(local_participant) = moved.participant {
             self.local_participant.update_info(local_participant);
             self.dispatcher.dispatch(&RoomEvent::ParticipantsUpdated {
@@ -2182,13 +2182,14 @@ impl RoomSession {
         return self.get_participant_by_identity(identity).map(Participant::Remote);
     }
 
-    fn handle_refresh_token(self: &Arc<Self>, url: String, token: String) {
+    fn handle_refresh_token(self: &Arc<Self>, url: String, token: ParticipantToken) {
         // notify refreshed token to registered audio filters
         for filter in registered_audio_filter_plugins().into_iter() {
-            filter.update_token(url.clone(), token.clone());
+            filter.update_token(url.clone(), &token);
         }
-        let event = RoomEvent::TokenRefreshed { token };
+        let event = RoomEvent::TokenRefreshed;
         self.dispatcher.dispatch(&event);
+        drop(token);
     }
 
     /// Task for handling output events from the local data track manager.
